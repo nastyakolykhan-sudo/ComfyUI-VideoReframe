@@ -347,15 +347,22 @@ def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast
         else:
             W, H = int(round(w * f)), int(round(h * f))
         X, Y = int(round(x * f)), int(round(y * f))
-        return MW, MH, W, H, X, Y, stretch_plan(MW, MH, X, Y, W, H, ratio, max_stretch)
+        # models draw the original up to ~2.5% larger, so it can run past the canvas on the side that wasn't
+        # extended: pad the master (its outer pixels mirrored) until the whole original fits, nothing cut
+        pad = (max(0, -Y), max(0, Y + H - MH), max(0, -X), max(0, X + W - MW)) if output_size == "source" else (0, 0, 0, 0)
+        MWp, MHp, Xp, Yp = MW + pad[2] + pad[3], MH + pad[0] + pad[1], X + pad[2], Y + pad[0]
+        return MW, MH, W, H, Xp, Yp, pad, MWp, MHp, stretch_plan(MWp, MHp, Xp, Yp, W, H, ratio, max_stretch)
+
+    def target(MWp, MHp, st):
+        return (st["size"], MHp) if st and st["axis"] == "x" else ((MWp, st["size"]) if st else (MWp, MHp))
 
     f = output_scale(w, sp["width"], MW0, MH0, output_size, 0)
-    MW, MH, W, H, X, Y, st = layout(f)
-    TW, TH = (st["size"], MH) if st and st["axis"] == "x" else ((MW, st["size"]) if st else (MW, MH))
+    MW, MH, W, H, X, Y, pad, MWp, MHp, st = layout(f)
+    TW, TH = target(MWp, MHp, st)
     if output_size == "source" and max_side and max(TW, TH) > max_side:   # the cap applies to the final size
         f *= max_side / float(max(TW, TH))
-        MW, MH, W, H, X, Y, st = layout(f)
-        TW, TH = (st["size"], MH) if st and st["axis"] == "x" else ((MW, st["size"]) if st else (MW, MH))
+        MW, MH, W, H, X, Y, pad, MWp, MHp, st = layout(f)
+        TW, TH = target(MWp, MHp, st)
     if st:
         X, Y = (X + st["shift"], Y) if st["axis"] == "x" else (X, Y + st["shift"])
     n = min(sp["frames"], mp["frames"])
@@ -373,6 +380,8 @@ def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast
         for (_, s_f), (_, m_f) in zip(S, M):
             z = s_f.astype(np.float32) if (W, H) == (s_f.shape[1], s_f.shape[0]) else _resize(s_f, W, H, Image.LANCZOS)
             o = m_f.astype(np.float32) if (MW, MH) == (MW0, MH0) else _resize(m_f, MW, MH, Image.LANCZOS)
+            if any(pad):
+                o = np.pad(o, ((pad[0], pad[1]), (pad[2], pad[3]), (0, 0)), mode="reflect")
             if st:
                 o = _apply_stretch(o, st)
             o[ya:yb, xa:xb] = z[ya - Y:yb - Y, xa - X:xb - X] * k + o[ya:yb, xa:xb] * (1 - k)
@@ -387,6 +396,7 @@ def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast
     pl.update({"frames": count, "fps": str(fps), "size": [OW, OH], "master_size": [MW0, MH0],
                "output_size": output_size, "upscale": round(f, 4), "original_pasted_at": [X, Y, W, H],
                "margin_stretch": ({"axis": st["axis"], "from": [st["a"], st["b"]], "to": [st["a2"], st["b2"]]} if st else None),
+               "edge_pad_tblr": list(pad) if any(pad) else None,
                "seam_sigma_px": sg, "audio": audio, "total_seconds": round(time.time() - t0, 2)})
     return pl
 
