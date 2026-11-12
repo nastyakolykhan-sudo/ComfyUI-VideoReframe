@@ -57,6 +57,11 @@ class VideoReframePasteBack:
                 "max_side": ("INT", {"default": 4096, "min": 0, "max": 16384, "step": 2,
                              "tooltip": "With output_size source: cap on the output's long side (0 = no cap). "
                                         "4096 keeps H.264 files playable everywhere."}),
+                "ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.0001,
+                          "tooltip": "The most extreme ratio (width / height) this master was made for; 0 = off. "
+                                     "Models round their canvases (MiniMax 768P 9:16 is 768x1344), leaving the "
+                                     "master 1-2% short: the generated margins are stretched to reach the ratio "
+                                     "(up to 6%), so cropping it never cuts the original."}),
             },
         }
 
@@ -71,7 +76,7 @@ class VideoReframePasteBack:
                    "it (models shift or scale it by a few pixels), samples both clips to the same frame count, "
                    "blends the seam on the sides that meet generated pixels, and keeps the source's sound.")
 
-    def paste(self, source, master, seam, placement="measure", output_size="source", max_side=4096):
+    def paste(self, source, master, seam, placement="measure", output_size="source", max_side=4096, ratio=0.0):
         src, mst = _as_file(source), _as_file(master)
         rect = None
         if placement == "centred fit":
@@ -80,7 +85,8 @@ class VideoReframePasteBack:
             w, h = sp["width"] * fit, sp["height"] * fit
             rect = [(mp["width"] - w) / 2, (mp["height"] - h) / 2, w, h]
         out = _temp("reframe_paste")
-        report = rc.paste_back(src, mst, out, rect=rect, seam=seam, output_size=output_size, max_side=max_side)
+        report = rc.paste_back(src, mst, out, rect=rect, seam=seam, output_size=output_size, max_side=max_side,
+                               ratio=float(ratio))
         return (VideoFromFile(out), json.dumps(report))
 
 

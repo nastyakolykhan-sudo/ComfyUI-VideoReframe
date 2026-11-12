@@ -281,32 +281,90 @@ def output_scale(rect_w, src_w, master_w, master_h, mode="source", max_side=4096
     return f
 
 
+def stretch_plan(MW, MH, X, Y, W, H, ratio, max_stretch=0.06):
+    """When a master is a little short of `ratio` (w/h) on the side it was made for, how to widen (or heighten) it by
+    stretching only the generated margins, so an exact-ratio crop never has to cut the original. Models round their
+    canvases (MiniMax 768P: 9:16 is 768x1344, 0.571), which leaves the master 1-2% short of the ratio it was asked
+    for. Returns None (nothing to do, or the shortfall is over max_stretch of the margins) or
+    {"axis": "x"|"y", "size": new width|height, "a": first margin, "b": last margin, "a2", "b2": their new sizes,
+     "shift": the original's move along the axis}."""
+    if not ratio or W <= 0 or H <= 0:
+        return None
+    src_r = W / H
+    if ratio > src_r * 1.001 and MW < MH * ratio - 0.5:          # wide: needs more width
+        axis, size, lo, span = "x", 2 * math.ceil(MH * ratio / 2), X, (MW, W)
+    elif ratio < src_r / 1.001 and MH < MW / ratio - 0.5:        # tall: needs more height
+        axis, size, lo, span = "y", 2 * math.ceil(MW / ratio / 2), Y, (MH, H)
+    else:
+        return None
+    full, orig = span
+    a = max(0, lo); b = max(0, full - (lo + orig))              # the generated margins before and after the original
+    extra = size - full
+    if a + b <= 0 or extra / float(a + b) > max_stretch:
+        return None
+    a2 = a + int(round(extra * a / float(a + b))); b2 = b + (extra - (a2 - a))
+    return {"axis": axis, "size": size, "a": a, "b": b, "a2": a2, "b2": b2, "shift": a2 - a}
+
+
+def _apply_stretch(o, sp):
+    """Stretch frame o's two generated margins along sp['axis'] (the middle, the original's span, is kept as is)."""
+    if sp["axis"] == "x":
+        Hh, Ww = o.shape[:2]; a, b = sp["a"], sp["b"]
+        parts = [_resize_f(o[:, :a], sp["a2"], Hh) if a else o[:, :0], o[:, a:Ww - b],
+                 _resize_f(o[:, Ww - b:], sp["b2"], Hh) if b else o[:, :0]]
+        return np.concatenate(parts, axis=1)
+    Hh, Ww = o.shape[:2]; a, b = sp["a"], sp["b"]
+    parts = [_resize_f(o[:a], Ww, sp["a2"]) if a else o[:0], o[a:Hh - b], _resize_f(o[Hh - b:], Ww, sp["b2"]) if b else o[:0]]
+    return np.concatenate(parts, axis=0)
+
+
+def _resize_f(a, w, h):
+    """Resize a float32 HxWx3 array (0-255) with Lanczos."""
+    return np.asarray(Image.fromarray(np.clip(a + 0.5, 0, 255).astype(np.uint8)).resize((int(w), int(h)), Image.LANCZOS),
+                      np.float32)
+
+
 def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast", placement_frames=3,
-               output_size="source", max_side=4096):
+               output_size="source", max_side=4096, ratio=0.0, max_stretch=0.06):
     """Paste the original back over the model's master where the model put it, streaming frame by frame.
     Both clips are sampled to N = min(frames) (the workflow's map); fps = master fps * N / master frames, so the
     duration stays the master's. output_size 'source' (default) upscales the model's frames so the original comes
     back at its own resolution, pasted 1:1 (only the generated edges are upscaled); 'master' keeps the model's size.
+    ratio (w/h, 0 = off): the most extreme ratio this master was made for; when the scaled master falls a little
+    short of it (the model's canvas is rounded), the generated margins are stretched to reach it (up to max_stretch
+    of their size), so cropping that ratio never cuts the original.
     Writes H.264 (yuv420p, even size) + the source's audio to out_path. Returns the placement report (dict)."""
     t0 = time.time()
     sp, mp = probe(src), probe(master)
     pl = measure_placement(src, master, placement_frames, sp, mp) if rect is None else {"rect": list(rect)}
     x, y, w, h = pl["rect"]
     MW0, MH0 = mp["width"], mp["height"]
-    f = output_scale(w, sp["width"], MW0, MH0, output_size, max_side)
-    MW, MH = int(round(MW0 * f)), int(round(MH0 * f))
-    if output_size == "source" and abs(f - sp["width"] / w) < 1e-9:
-        W, H = sp["width"], sp["height"]  # the original exactly at its own size: no resampling
-    else:
-        W, H = int(round(w * f)), int(round(h * f))
-    X, Y = int(round(x * f)), int(round(y * f))
+
+    def layout(f):
+        MW, MH = int(round(MW0 * f)), int(round(MH0 * f))
+        if output_size == "source" and abs(f - sp["width"] / w) < 1e-9:
+            W, H = sp["width"], sp["height"]  # the original exactly at its own size: no resampling
+        else:
+            W, H = int(round(w * f)), int(round(h * f))
+        X, Y = int(round(x * f)), int(round(y * f))
+        return MW, MH, W, H, X, Y, stretch_plan(MW, MH, X, Y, W, H, ratio, max_stretch)
+
+    f = output_scale(w, sp["width"], MW0, MH0, output_size, 0)
+    MW, MH, W, H, X, Y, st = layout(f)
+    TW, TH = (st["size"], MH) if st and st["axis"] == "x" else ((MW, st["size"]) if st else (MW, MH))
+    if output_size == "source" and max_side and max(TW, TH) > max_side:   # the cap applies to the final size
+        f *= max_side / float(max(TW, TH))
+        MW, MH, W, H, X, Y, st = layout(f)
+        TW, TH = (st["size"], MH) if st and st["axis"] == "x" else ((MW, st["size"]) if st else (MW, MH))
+    if st:
+        X, Y = (X + st["shift"], Y) if st["axis"] == "x" else (X, Y + st["shift"])
     n = min(sp["frames"], mp["frames"])
     smap, mmap = sample_indices(sp["frames"], n), sample_indices(mp["frames"], n)
     fps = mp["fps"] if n == mp["frames"] else Fraction(mp["fps"] * n / mp["frames"]).limit_denominator(100_000)
-    mask, sg = seam_mask(MW, MH, X, Y, W, H, seam)
-    xa, ya, xb, yb = max(0, X), max(0, Y), min(MW, X + W), min(MH, Y + H)
+    mask, sg = seam_mask(TW, TH, X, Y, W, H, seam)
+    xa, ya, xb, yb = max(0, X), max(0, Y), min(TW, X + W), min(TH, Y + H)
     k = mask[ya:yb, xa:xb]
-    OW, OH = MW - MW % 2, MH - MH % 2
+    OW, OH = TW - TW % 2, TH - TH % 2
     out, vs = _open_writer(out_path, fps, OW, OH, crf, preset)
     write_audio = _add_audio(src, out)
     S = iter_frames(src, set(smap)); M = iter_frames(master, set(mmap))
@@ -315,6 +373,8 @@ def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast
         for (_, s_f), (_, m_f) in zip(S, M):
             z = s_f.astype(np.float32) if (W, H) == (s_f.shape[1], s_f.shape[0]) else _resize(s_f, W, H, Image.LANCZOS)
             o = m_f.astype(np.float32) if (MW, MH) == (MW0, MH0) else _resize(m_f, MW, MH, Image.LANCZOS)
+            if st:
+                o = _apply_stretch(o, st)
             o[ya:yb, xa:xb] = z[ya - Y:yb - Y, xa - X:xb - X] * k + o[ya:yb, xa:xb] * (1 - k)
             _put(out, vs, np.clip(o + 0.5, 0, 255).astype(np.uint8)[:OH, :OW], count)
             count += 1
@@ -326,6 +386,7 @@ def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast
         out.close()
     pl.update({"frames": count, "fps": str(fps), "size": [OW, OH], "master_size": [MW0, MH0],
                "output_size": output_size, "upscale": round(f, 4), "original_pasted_at": [X, Y, W, H],
+               "margin_stretch": ({"axis": st["axis"], "from": [st["a"], st["b"]], "to": [st["a2"], st["b2"]]} if st else None),
                "seam_sigma_px": sg, "audio": audio, "total_seconds": round(time.time() - t0, 2)})
     return pl
 
