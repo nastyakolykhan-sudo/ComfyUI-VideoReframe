@@ -140,6 +140,65 @@ class VideoRetime:
         return (VideoFromFile(out),)
 
 
+class VideoReframeLTXCanvas:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO", {"tooltip": "The clip to outpaint."}),
+                "ratio": ("FLOAT", {"default": 0.5625, "min": 0.1, "max": 10.0, "step": 0.0001,
+                                    "tooltip": "The canvas ratio, width / height (9:16 = 0.5625). The clip is padded "
+                                               "to it, nothing is cut."}),
+                "pixels": ("INT", {"default": 921600, "min": 65536, "max": 8294400, "step": 1024,
+                                   "tooltip": "Canvas area in pixels (921600 = 1280x720). Never above the clip's own "
+                                              "scale; each side a multiple of 32."}),
+                "max_seconds": ("FLOAT", {"default": 10.0, "min": 0.0, "max": 600.0, "step": 0.5,
+                                          "tooltip": "Longer clips stop the run with a clear message (0 = no limit)."}),
+                "gamma": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 4.0, "step": 0.05,
+                                    "tooltip": "Power curve on the guide frames, as in the LTX 2.3 outpainting "
+                                               "template; Image Gamma 0.5 on the decoded frames undoes it."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "FLOAT", "INT")
+    RETURN_NAMES = ("guide", "width", "height", "frames", "fps", "fps_int")
+    OUTPUT_TOOLTIPS = ("The clip fitted inside a black canvas of the ratio, 8n+1 frames.", "Canvas width.",
+                       "Canvas height.", "Frame count (8n+1).",
+                       "Frame rate that keeps the clip's duration with these frames.", "The same, rounded.")
+    FUNCTION = "canvas"
+    CATEGORY = CATEGORY
+    DESCRIPTION = ("Guide frames for LTX 2.3 IC-LoRA outpainting: the clip centred on a black canvas of the given ratio "
+                   "and area, sampled to 8n+1 frames with the same map Reframe Paste Back uses, so the master lines up "
+                   "with the source frame for frame. Streams the clip; only canvas-size frames are held.")
+
+    def canvas(self, video, ratio, pixels, max_seconds, gamma):
+        import torch
+        frames, info = rc.ltx_canvas_frames(_as_file(video), float(ratio), int(pixels), float(max_seconds),
+                                            float(gamma))
+        return (torch.from_numpy(frames), info["width"], info["height"], info["frames"], info["fps"],
+                max(1, int(round(info["fps"]))))
+
+
+class VideoReframeImageGamma:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "gamma": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 4.0, "step": 0.05,
+                                    "tooltip": "Each value v becomes v ** gamma (below 1 brightens, above darkens)."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "apply"
+    CATEGORY = CATEGORY
+    DESCRIPTION = "A power curve on images (v ** gamma, values clamped to 0-1 first). 0.5 undoes the LTX guide curve."
+
+    def apply(self, image, gamma):
+        return (image.clamp(0.0, 1.0).pow(float(gamma)),)
+
+
 class VideoReframeInfo:
     @classmethod
     def INPUT_TYPES(cls):
@@ -166,8 +225,12 @@ NODE_CLASS_MAPPINGS = {
     "VideoCropToRatio": VideoCropToRatio,
     "VideoRetime": VideoRetime,
     "VideoReframeInfo": VideoReframeInfo,
+    "VideoReframeLTXCanvas": VideoReframeLTXCanvas,
+    "VideoReframeImageGamma": VideoReframeImageGamma,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "VideoReframeLTXCanvas": "LTX Outpaint Canvas",
+    "VideoReframeImageGamma": "Image Gamma (Reframe)",
     "VideoReframePasteBack": "Reframe Paste Back",
     "VideoCropToRatio": "Crop Video To Ratio",
     "VideoRetime": "Retime Video",

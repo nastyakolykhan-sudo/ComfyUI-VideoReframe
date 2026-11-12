@@ -8,6 +8,7 @@ so everything here can be tested outside ComfyUI.
 - paste_back(src, master, out)     the original pasted back at the measured place, H.264 + the source's audio
 - crop_to_ratio(w, h, rw, rh)      the largest centred rectangle of an exact ratio, even sizes
 - retime(src, out, speed)          same frames at fps * speed (audio tempo-changed or dropped)
+- ltx_canvas_frames(src, ratio, …) the clip on a black canvas of `ratio`, 8n+1 frames, for LTX 2.3 outpainting
 """
 import json, math, os, time
 from fractions import Fraction
@@ -327,6 +328,63 @@ def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast
                "output_size": output_size, "upscale": round(f, 4), "original_pasted_at": [X, Y, W, H],
                "seam_sigma_px": sg, "audio": audio, "total_seconds": round(time.time() - t0, 2)})
     return pl
+
+
+# ---------------------------------------------------------------------------------------------------- LTX canvas
+
+
+def ltx_frame_count(total):
+    """LTX generates 8n+1 frames: the largest such count <= total (at least 9)."""
+    if total < 9:
+        raise ValueError(f"LTX needs at least 9 frames; this clip has {total}.")
+    return 8 * ((total - 1) // 8) + 1
+
+
+def ltx_canvas_size(W, H, ratio, pixels, multiple=32, min_side=256):
+    """The LTX canvas for a W x H clip outpainted to `ratio` (w/h): the clip padded to that ratio (nothing cut), scaled
+    to about `pixels` in area (never above the clip's own scale), each side a multiple of `multiple`. The expanded
+    side is rounded up, so the canvas is never short of `ratio` there and the exact-ratio crop never cuts the clip.
+    Returns (cw, ch, x, y, fw, fh): the canvas size and the fitted clip's rectangle in it (even sizes, centred)."""
+    CW, CH = max(W, H * ratio), max(H, W / ratio)
+    s = min(1.0, math.sqrt(pixels / (CW * CH)))
+    if H * ratio >= W:  # wider (or the same): the clip fills the height, the width grows
+        ch = max(min_side, int(multiple * round(H * s / multiple)))
+        cw = max(min_side, int(multiple * math.ceil(ch * ratio / multiple - 1e-9)))
+    else:  # taller: the clip fills the width, the height grows
+        cw = max(min_side, int(multiple * round(W * s / multiple)))
+        ch = max(min_side, int(multiple * math.ceil(cw / ratio / multiple - 1e-9)))
+    f = min(cw / W, ch / H)
+    fw, fh = min(cw, 2 * round(W * f / 2)), min(ch, 2 * round(H * f / 2))
+    return cw, ch, (cw - fw) // 2, (ch - fh) // 2, int(fw), int(fh)
+
+
+def ltx_canvas_frames(src, ratio, pixels, max_seconds=10.0, gamma=2.0):
+    """The clip as LTX outpainting guide frames: sampled to 8n+1 frames with the workflow's map (so Reframe Paste Back
+    lines the master up with the source frame for frame), fitted inside the black canvas from ltx_canvas_size, then
+    raised to `gamma` (the LTX 2.3 outpainting template's guide curve; 0.5 on the output undoes it). Streams the source,
+    so only canvas-size frames are held. Returns (frames float32 [n, ch, cw, 3] in 0-1, info dict)."""
+    sp = probe(src)
+    if max_seconds and sp["duration"] > max_seconds + 0.5 / float(sp["fps"]):
+        raise ValueError(f"LTX 2.3 takes clips up to {max_seconds:g} s; this one is {sp['duration']:.2f} s. Trim it or "
+                         f"pick MiniMax H3 Max (up to 300 s).")
+    total = sp["frames"]
+    n = ltx_frame_count(total)
+    idx = sample_indices(total, n)
+    cw, ch, x, y, fw, fh = ltx_canvas_size(sp["width"], sp["height"], ratio, pixels)
+    out = np.zeros((n, ch, cw, 3), np.float32)
+    pos = {}
+    for k, i in enumerate(idx):
+        pos.setdefault(i, []).append(k)
+    for i, f in iter_frames(src, set(idx)):
+        a = _resize(f, fw, fh, Image.LANCZOS) / 255.0
+        np.clip(a, 0.0, 1.0, out=a)
+        if gamma != 1.0:
+            a **= gamma
+        for k in pos.get(i, ()):
+            out[k, y:y + fh, x:x + fw] = a
+    fps = Fraction(sp["fps"] * n / total).limit_denominator(100_000) if n != total else sp["fps"]
+    return out, {"frames": n, "source_frames": total, "fps": float(fps), "width": cw, "height": ch,
+                 "fit_rect": [x, y, fw, fh], "source_size": [sp["width"], sp["height"]]}
 
 
 # ---------------------------------------------------------------------------------------------------- crop / retime
