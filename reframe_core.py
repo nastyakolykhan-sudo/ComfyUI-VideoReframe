@@ -268,17 +268,37 @@ def _add_audio(src, out, tempo=1.0):
     return write
 
 
-def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast", placement_frames=3):
+def output_scale(rect_w, src_w, master_w, master_h, mode="source", max_side=4096):
+    """Factor applied to the master before the paste. 'source': the original comes back at its own resolution
+    (factor = source width / the original's width in the master), capped so the long side stays <= max_side
+    (0 = no cap). 'master': 1 (output at the model's size)."""
+    if mode != "source":
+        return 1.0
+    f = src_w / rect_w
+    if max_side and max(master_w, master_h) * f > max_side:
+        f = max_side / max(master_w, master_h)
+    return f
+
+
+def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast", placement_frames=3,
+               output_size="source", max_side=4096):
     """Paste the original back over the model's master where the model put it, streaming frame by frame.
     Both clips are sampled to N = min(frames) (the workflow's map); fps = master fps * N / master frames, so the
-    duration stays the master's. Writes H.264 (yuv420p, even size) + the source's audio to out_path.
-    Returns the placement report (dict)."""
+    duration stays the master's. output_size 'source' (default) upscales the model's frames so the original comes
+    back at its own resolution, pasted 1:1 (only the generated edges are upscaled); 'master' keeps the model's size.
+    Writes H.264 (yuv420p, even size) + the source's audio to out_path. Returns the placement report (dict)."""
     t0 = time.time()
     sp, mp = probe(src), probe(master)
     pl = measure_placement(src, master, placement_frames, sp, mp) if rect is None else {"rect": list(rect)}
     x, y, w, h = pl["rect"]
-    W, H, X, Y = int(round(w)), int(round(h)), int(round(x)), int(round(y))
-    MW, MH = mp["width"], mp["height"]
+    MW0, MH0 = mp["width"], mp["height"]
+    f = output_scale(w, sp["width"], MW0, MH0, output_size, max_side)
+    MW, MH = int(round(MW0 * f)), int(round(MH0 * f))
+    if output_size == "source" and abs(f - sp["width"] / w) < 1e-9:
+        W, H = sp["width"], sp["height"]  # the original exactly at its own size: no resampling
+    else:
+        W, H = int(round(w * f)), int(round(h * f))
+    X, Y = int(round(x * f)), int(round(y * f))
     n = min(sp["frames"], mp["frames"])
     smap, mmap = sample_indices(sp["frames"], n), sample_indices(mp["frames"], n)
     fps = mp["fps"] if n == mp["frames"] else Fraction(mp["fps"] * n / mp["frames"]).limit_denominator(100_000)
@@ -292,8 +312,8 @@ def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast
     count = 0
     try:
         for (_, s_f), (_, m_f) in zip(S, M):
-            z = _resize(s_f, W, H, Image.LANCZOS)
-            o = m_f.astype(np.float32)
+            z = s_f.astype(np.float32) if (W, H) == (s_f.shape[1], s_f.shape[0]) else _resize(s_f, W, H, Image.LANCZOS)
+            o = m_f.astype(np.float32) if (MW, MH) == (MW0, MH0) else _resize(m_f, MW, MH, Image.LANCZOS)
             o[ya:yb, xa:xb] = z[ya - Y:yb - Y, xa - X:xb - X] * k + o[ya:yb, xa:xb] * (1 - k)
             _put(out, vs, np.clip(o + 0.5, 0, 255).astype(np.uint8)[:OH, :OW], count)
             count += 1
@@ -303,8 +323,9 @@ def paste_back(src, master, out_path, rect=None, seam=0.02, crf=12, preset="fast
             write_audio()
     finally:
         out.close()
-    pl.update({"frames": count, "fps": str(fps), "size": [OW, OH], "seam_sigma_px": sg, "audio": audio,
-               "total_seconds": round(time.time() - t0, 2)})
+    pl.update({"frames": count, "fps": str(fps), "size": [OW, OH], "master_size": [MW0, MH0],
+               "output_size": output_size, "upscale": round(f, 4), "original_pasted_at": [X, Y, W, H],
+               "seam_sigma_px": sg, "audio": audio, "total_seconds": round(time.time() - t0, 2)})
     return pl
 
 
@@ -344,7 +365,8 @@ if __name__ == "__main__":  # offline use: python reframe_core.py paste SRC MAST
     cmd = sys.argv[1]
     if cmd == "measure":
         print(json.dumps(measure_placement(sys.argv[2], sys.argv[3]), indent=1))
-    elif cmd == "paste":
-        print(json.dumps(paste_back(sys.argv[2], sys.argv[3], sys.argv[4]), indent=1))
+    elif cmd == "paste":  # paste SRC MASTER OUT [source|master]
+        mode = sys.argv[5] if len(sys.argv) > 5 else "source"
+        print(json.dumps(paste_back(sys.argv[2], sys.argv[3], sys.argv[4], output_size=mode), indent=1))
     elif cmd == "retime":
         print(json.dumps(retime(sys.argv[2], sys.argv[3], float(sys.argv[4])), indent=1))
